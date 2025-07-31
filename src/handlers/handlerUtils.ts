@@ -1,21 +1,5 @@
 import { Context } from 'hono';
-import {
-  AZURE_OPEN_AI,
-  BEDROCK,
-  WORKERS_AI,
-  HEADER_KEYS,
-  POWERED_BY,
-  GOOGLE_VERTEX_AI,
-  OPEN_AI,
-  AZURE_AI_INFERENCE,
-  ANTHROPIC,
-  CONTENT_TYPES,
-  HUGGING_FACE,
-  STABILITY_AI,
-  SAGEMAKER,
-  FIREWORKS_AI,
-  CORTEX,
-} from '../globals';
+import { HEADER_KEYS, CONTENT_TYPES } from '../globals';
 import { endpointStrings } from '../providers/types';
 import { Options, Params, StrategyModes, Targets } from '../types/requestBody';
 import { convertKeysToCamelCase } from '../utils';
@@ -23,8 +7,6 @@ import { retryRequest } from './retryHandler';
 import { env } from 'hono/adapter';
 import { afterRequestHookHandler, responseHandler } from './responseHandlers';
 import { HookSpan } from '../middlewares/hooks';
-import { ConditionalRouter } from '../services/conditionalRouter';
-import { RouterError } from '../errors/RouterError';
 import { GatewayError } from '../errors/GatewayError';
 import { HookType } from '../middlewares/hooks/types';
 
@@ -36,25 +18,30 @@ import { PreRequestValidatorService } from './services/preRequestValidatorServic
 import { ProviderContext } from './services/providerContext';
 import { RequestContext } from './services/requestContext';
 import { ResponseService } from './services/responseService';
+import { RequestProcessor } from './services/requestProcessor';
+import { ProviderConfigBuilder } from './services/providerConfigBuilder';
+import { HeaderProcessor } from './services/headerProcessor';
+import { RequestErrorHandler } from './services/errorHandler';
+import { StrategyFactory } from './strategies';
+
+// Constants and Types
+import { REQUEST_PROCESSING, ERROR_MESSAGES, HOOK_PROPERTIES, STRATEGY_CONFIG } from './constants';
+import { 
+  HookShorthandInput, 
+  ProcessedHookObject, 
+  StrategyContext, 
+  InheritedConfigData,
+  CircuitBreakerConfig 
+} from './types';
 
 function constructRequestBody(
   requestContext: RequestContext,
   providerHeaders: Record<string, string>
 ): BodyInit | null {
-  const headerContentType = providerHeaders[HEADER_KEYS.CONTENT_TYPE];
-  const requestContentType = requestContext.getHeader(HEADER_KEYS.CONTENT_TYPE);
+  const { isMultiPartRequest, isProxyAudio, shouldProcessAsJson } = 
+    HeaderProcessor.shouldProcessRequestBody(requestContext, providerHeaders);
 
   let body: BodyInit | null = null;
-
-  const isMultiPartRequest =
-    headerContentType === CONTENT_TYPES.MULTIPART_FORM_DATA ||
-    (requestContext.endpoint == 'proxy' &&
-      requestContentType === CONTENT_TYPES.MULTIPART_FORM_DATA);
-
-  const isProxyAudio =
-    requestContext.endpoint == 'proxy' &&
-    requestContentType?.startsWith(CONTENT_TYPES.GENERIC_AUDIO_PATTERN);
-
   const reqBody = requestContext.transformedRequestBody;
 
   if (isMultiPartRequest) {
@@ -63,7 +50,7 @@ function constructRequestBody(
     body = requestContext.requestBody;
   } else if (isProxyAudio) {
     body = reqBody as ArrayBuffer;
-  } else if (requestContentType) {
+  } else if (shouldProcessAsJson) {
     body = JSON.stringify(reqBody);
   }
 
@@ -76,88 +63,10 @@ function constructRequestBody(
 
 function constructRequestHeaders(
   requestContext: RequestContext,
-  providerConfigMappedHeaders: any
+  providerConfigMappedHeaders: Record<string, string>
 ): Record<string, string> {
-  const {
-    method,
-    forwardHeaders,
-    requestHeaders,
-    endpoint: fn,
-    honoContext: c,
-  } = requestContext;
-
-  const proxyHeaders: Record<string, string> = {};
-  // Handle proxy headers
-  if (fn === 'proxy') {
-    const poweredByHeadersPattern = `x-${POWERED_BY}-`;
-    const headersToAvoidForCloudflare = ['expect'];
-    const headersToIgnore = [
-      ...(env(c).CUSTOM_HEADERS_TO_IGNORE ?? []),
-      ...headersToAvoidForCloudflare,
-    ];
-    headersToIgnore.push('content-length');
-    Object.keys(requestHeaders).forEach((key: string) => {
-      if (
-        !headersToIgnore.includes(key) &&
-        !key.startsWith(poweredByHeadersPattern)
-      ) {
-        proxyHeaders[key] = requestHeaders[key];
-      }
-    });
-    // Remove brotli from accept-encoding because cloudflare has problems with it
-    // if (proxyHeaders['accept-encoding']?.includes('br'))
-    //   proxyHeaders['accept-encoding'] = proxyHeaders[
-    //     'accept-encoding'
-    //   ]?.replace('br', '');
-  }
-  const baseHeaders: any = {
-    'content-type': 'application/json',
-    ...(requestHeaders['accept-encoding'] && {
-      'accept-encoding': requestHeaders['accept-encoding'],
-    }),
-  };
-
-  let headers: Record<string, string> = {};
-
-  Object.keys(providerConfigMappedHeaders).forEach((h: string) => {
-    headers[h.toLowerCase()] = providerConfigMappedHeaders[h];
-  });
-
-  const forwardHeadersMap: Record<string, string> = {};
-
-  forwardHeaders.forEach((h: string) => {
-    const lowerCaseHeaderKey = h.toLowerCase();
-    if (requestHeaders[lowerCaseHeaderKey])
-      forwardHeadersMap[lowerCaseHeaderKey] =
-        requestHeaders[lowerCaseHeaderKey];
-  });
-
-  // Add any headers that the model might need
-  headers = {
-    ...baseHeaders,
-    ...headers,
-    ...forwardHeadersMap,
-    ...(fn === 'proxy' && proxyHeaders),
-  };
-
-  const contentType = headers['content-type']?.split(';')[0];
-  const isGetMethod = method === 'GET';
-  const isMultipartFormData = contentType === CONTENT_TYPES.MULTIPART_FORM_DATA;
-  const shouldDeleteContentTypeHeader =
-    (isGetMethod || isMultipartFormData) && headers;
-
-  if (shouldDeleteContentTypeHeader) {
-    delete headers['content-type'];
-    if (fn === 'uploadFile') {
-      headers['Content-Type'] = requestHeaders['content-type'];
-      if (requestHeaders[`x-${POWERED_BY}-file-purpose`]) {
-        headers[`x-${POWERED_BY}-file-purpose`] =
-          requestHeaders[`x-${POWERED_BY}-file-purpose`];
-      }
-    }
-  }
-
-  return headers;
+  const headerProcessor = new HeaderProcessor(requestContext);
+  return headerProcessor.buildFinalHeaders(providerConfigMappedHeaders, requestContext.forwardHeaders);
 }
 
 /**
@@ -204,55 +113,50 @@ export async function constructRequest(
  * @throws Will throw an error if no provider is selected, or if all weights are 0.
  */
 export function selectProviderByWeight(providers: Options[]): Options {
-  // Assign a default weight of 1 to providers with undefined weight
-  providers = providers.map((provider) => ({
+  // Assign a default weight to providers with undefined weight
+  const weightedProviders = providers.map((provider) => ({
     ...provider,
-    weight: provider.weight ?? 1,
+    weight: provider.weight ?? REQUEST_PROCESSING.DEFAULT_WEIGHT,
   }));
 
   // Compute the total weight
-  const totalWeight = providers.reduce(
-    (sum: number, provider: any) => sum + provider.weight,
+  const totalWeight = weightedProviders.reduce(
+    (sum: number, provider) => sum + (provider.weight || 0),
     0
   );
+
+  if (totalWeight === 0) {
+    throw new Error(ERROR_MESSAGES.NO_PROVIDER_SELECTED);
+  }
 
   // Select a random weight between 0 and totalWeight
   let randomWeight = Math.random() * totalWeight;
 
   // Find the provider that corresponds to the selected weight
-  for (const [index, provider] of providers.entries()) {
-    // @ts-ignore since weight is being default set above
-    if (randomWeight < provider.weight) {
+  for (const [index, provider] of weightedProviders.entries()) {
+    const providerWeight = provider.weight || 0;
+    if (randomWeight < providerWeight) {
       return { ...provider, index };
     }
-    // @ts-ignore since weight is being default set above
-    randomWeight -= provider.weight;
+    randomWeight -= providerWeight;
   }
 
-  throw new Error('No provider selected, please check the weights');
+  throw new Error(ERROR_MESSAGES.NO_PROVIDER_SELECTED);
 }
 
 export function convertHooksShorthand(
-  hooksArr: any,
+  hooksArr: HookShorthandInput[],
   type: string,
   hookType: HookType
-) {
-  return hooksArr.map((hook: any) => {
+): ProcessedHookObject[] {
+  return hooksArr.map((hook: HookShorthandInput) => {
     let hooksObject: any = {
       type: hookType,
-      id: `${type}_guardrail_${Math.random().toString(36).substring(2, 5)}`,
+      id: `${type}_guardrail_${Math.random().toString(36).substring(2, HOOK_PROPERTIES.EXTRACTABLE_KEYS.length)}`,
     };
 
-    // if the deny key is present (true or false), add it to hooksObject and remove it from guardrails
-    [
-      'deny',
-      'on_fail',
-      'on_success',
-      'async',
-      'id',
-      'type',
-      'guardrail_version_id',
-    ].forEach((key) => {
+    // Extract known properties from hook and add to hooksObject
+    HOOK_PROPERTIES.EXTRACTABLE_KEYS.forEach((key) => {
       if (hook.hasOwnProperty(key)) {
         hooksObject[key] = hook[key];
         delete hook[key];
@@ -261,14 +165,14 @@ export function convertHooksShorthand(
 
     hooksObject = convertKeysToCamelCase(hooksObject);
 
-    // Now, add all the checks to the checks array
+    // Add all remaining properties as checks
     hooksObject.checks = Object.keys(hook).map((key) => ({
-      id: key.includes('.') ? key : `default.${key}`,
+      id: key.includes('.') ? key : `${HOOK_PROPERTIES.DEFAULT_PLUGIN_PREFIX}${key}`,
       parameters: hook[key],
-      is_enabled: hook[key].is_enabled,
+      is_enabled: hook[key]?.is_enabled,
     }));
 
-    return hooksObject;
+    return hooksObject as ProcessedHookObject;
   });
 }
 
@@ -292,179 +196,17 @@ export async function tryPost(
   currentIndex: number | string,
   method: string = 'POST'
 ): Promise<Response> {
-  const requestContext = new RequestContext(
-    c,
-    providerOption,
-    fn,
-    requestHeaders,
-    requestBody,
-    method,
-    currentIndex as number
+  const processor = new RequestProcessor(
+    c, 
+    providerOption, 
+    requestBody, 
+    requestHeaders, 
+    fn, 
+    currentIndex, 
+    method
   );
-  const hooksService = new HooksService(requestContext);
-  const providerContext = new ProviderContext(requestContext.provider);
-  const logsService = new LogsService(c);
-  const responseService = new ResponseService(requestContext, hooksService);
-  const hookSpan: HookSpan = hooksService.hookSpan;
-
-  // Set the requestURL in requestContext
-  requestContext.requestURL = await providerContext.getFullURL(requestContext);
-
-  // Create the base log object from requestContext
-  const logObject = new LogObjectBuilder(logsService, requestContext);
-  logObject.addHookSpanId(hookSpan.id);
-
-  // before_request_hooks handler
-  const {
-    response: brhResponse,
-    createdAt: brhCreatedAt,
-    transformedBody,
-  } = await beforeRequestHookHandler(c, hookSpan.id);
-  if (brhResponse) {
-    // transformedRequestBody is required to be set in requestOptions.
-    // So in case the before request hooks fail (with deny as true), we need to set it here.
-    // If the hooks do not result in a 446 response, transformedRequestBody is determined on the updated HookSpan context.
-    if (!providerContext.hasRequestHandler(requestContext)) {
-      requestContext.transformToProviderRequestAndSave();
-    }
-
-    const { response, originalResponseJson } = await responseService.create({
-      response: brhResponse,
-      responseTransformer: undefined,
-      isResponseAlreadyMapped: false,
-      cache: {
-        isCacheHit: false,
-        cacheStatus: undefined,
-        cacheKey: undefined,
-      },
-      retryAttempt: 0,
-      createdAt: brhCreatedAt,
-    });
-
-    logObject
-      .updateRequestContext(requestContext)
-      .addResponse(response, originalResponseJson)
-      .addCache()
-      .log();
-
-    return response;
-  }
-
-  // If before request hook transformed the body, update the request context
-  if (transformedBody) {
-    requestContext.params = hookSpan.getContext().request.json;
-  }
-
-  // Attach the body of the request
-  if (!providerContext.hasRequestHandler(requestContext)) {
-    requestContext.transformToProviderRequestAndSave();
-  }
-
-  // Construct the base object for the request
-  const fetchOptions: RequestInit = await constructRequest(
-    providerContext,
-    requestContext
-  );
-
-  // Cache Handler
-  const cacheService = new CacheService(c, hooksService);
-  const cacheResponseObject: CacheResponseObject =
-    await cacheService.getCachedResponse(
-      requestContext,
-      fetchOptions.headers || {}
-    );
-  logObject.addCache(
-    cacheResponseObject.cacheStatus,
-    cacheResponseObject.cacheKey
-  );
-  if (cacheResponseObject.cacheResponse) {
-    const { response, originalResponseJson } = await responseService.create({
-      response: cacheResponseObject.cacheResponse,
-      responseTransformer: requestContext.endpoint,
-      cache: {
-        isCacheHit: true,
-        cacheStatus: cacheResponseObject.cacheStatus,
-        cacheKey: cacheResponseObject.cacheKey,
-      },
-      isResponseAlreadyMapped: false,
-      retryAttempt: 0,
-      fetchOptions,
-      createdAt: cacheResponseObject.createdAt,
-      executionTime: 0,
-    });
-
-    logObject
-      .updateRequestContext(requestContext, fetchOptions.headers)
-      .addResponse(response, originalResponseJson)
-      .log();
-
-    return response;
-  }
-
-  // Prerequest validator (For virtual key budgets)
-  const preRequestValidatorService = new PreRequestValidatorService(
-    c,
-    requestContext
-  );
-  const preRequestValidatorResponse =
-    await preRequestValidatorService.getResponse();
-  if (preRequestValidatorResponse) {
-    const { response, originalResponseJson } = await responseService.create({
-      response: preRequestValidatorResponse,
-      responseTransformer: undefined,
-      isResponseAlreadyMapped: false,
-      cache: {
-        isCacheHit: false,
-        cacheStatus: cacheResponseObject.cacheStatus,
-        cacheKey: cacheResponseObject.cacheKey,
-      },
-      retryAttempt: 0,
-      fetchOptions,
-      createdAt: new Date(),
-    });
-
-    logObject
-      .updateRequestContext(requestContext, fetchOptions.headers)
-      .addResponse(response, originalResponseJson)
-      .log();
-
-    return response;
-  }
-
-  // Request Handler (Including retries, recursion and hooks)
-  const { mappedResponse, retryCount, createdAt, originalResponseJson } =
-    await recursiveAfterRequestHookHandler(
-      requestContext,
-      fetchOptions,
-      0,
-      hookSpan.id,
-      providerContext,
-      hooksService,
-      logObject
-    );
-
-  const { response, originalResponseJson: mappedOriginalResponseJson } =
-    await responseService.create({
-      response: mappedResponse,
-      responseTransformer: undefined,
-      isResponseAlreadyMapped: true,
-      cache: {
-        isCacheHit: false,
-        cacheStatus: cacheResponseObject.cacheStatus,
-        cacheKey: cacheResponseObject.cacheKey,
-      },
-      retryAttempt: retryCount,
-      fetchOptions,
-      createdAt,
-      originalResponseJson,
-    });
-
-  logObject
-    .updateRequestContext(requestContext, fetchOptions.headers)
-    .addResponse(response, mappedOriginalResponseJson)
-    .log();
-
-  return response;
+  
+  return processor.process();
 }
 
 export async function tryTargetsRecursively(
@@ -475,7 +217,7 @@ export async function tryTargetsRecursively(
   fn: endpointStrings,
   method: string,
   jsonPath: string,
-  inheritedConfig: Record<string, any> = {}
+  inheritedConfig: InheritedConfigData = {}
 ): Promise<Response> {
   const currentTarget: any = { ...targetGroup };
   let currentJsonPath = jsonPath;
@@ -653,123 +395,32 @@ export async function tryTargetsRecursively(
 
   let response;
 
-  switch (strategyMode) {
-    case StrategyModes.FALLBACK:
-      for (const [index, target] of currentTarget.targets.entries()) {
-        const originalIndex = target.originalIndex || index;
-        response = await tryTargetsRecursively(
-          c,
-          target,
-          request,
-          requestHeaders,
-          fn,
-          method,
-          `${currentJsonPath}.targets[${originalIndex}]`,
-          currentInheritedConfig
-        );
-        const codes = currentTarget.strategy?.onStatusCodes;
-        const gatewayException =
-          response?.headers.get('x-portkey-gateway-exception') === 'true';
-        if (
-          // If onStatusCodes is provided, and the response status is not in the list
-          (Array.isArray(codes) && !codes.includes(response?.status)) ||
-          // If onStatusCodes is not provided, and the response is ok
-          (!codes && response?.ok) ||
-          // If the response is a gateway exception
-          gatewayException
-        ) {
-          // Skip the fallback
-          break;
-        }
-      }
-      break;
-
-    case StrategyModes.LOADBALANCE:
-      currentTarget.targets.forEach((t: Options) => {
-        if (t.weight === undefined) {
-          t.weight = 1;
-        }
-      });
-      let totalWeight = currentTarget.targets.reduce(
-        (sum: number, provider: any) => sum + provider.weight,
-        0
-      );
-
-      let randomWeight = Math.random() * totalWeight;
-      for (const [index, provider] of currentTarget.targets.entries()) {
-        const originalIndex = provider.originalIndex || index;
-        if (randomWeight < provider.weight) {
-          currentJsonPath = currentJsonPath + `.targets[${originalIndex}]`;
-          response = await tryTargetsRecursively(
-            c,
-            provider,
-            request,
-            requestHeaders,
-            fn,
-            method,
-            currentJsonPath,
-            currentInheritedConfig
-          );
-          break;
-        }
-        randomWeight -= provider.weight;
-      }
-      break;
-
-    case StrategyModes.CONDITIONAL: {
-      let metadata: Record<string, string>;
-      try {
-        metadata = JSON.parse(requestHeaders[HEADER_KEYS.METADATA]);
-      } catch (err) {
-        metadata = {};
-      }
-
-      let params =
-        request instanceof FormData ||
-        request instanceof ReadableStream ||
-        request instanceof ArrayBuffer
-          ? {} // Send empty object if not JSON
-          : request;
-
-      let conditionalRouter: ConditionalRouter;
-      let finalTarget: Targets;
-      try {
-        conditionalRouter = new ConditionalRouter(currentTarget, {
-          metadata,
-          params,
-        });
-        finalTarget = conditionalRouter.resolveTarget();
-      } catch (conditionalRouter: any) {
-        throw new RouterError(conditionalRouter.message);
-      }
-
-      const originalIndex = finalTarget.originalIndex || finalTarget.index;
-      response = await tryTargetsRecursively(
+  // Use strategy pattern for target execution
+  if (strategyMode && currentTarget.targets) {
+    try {
+      const strategy = StrategyFactory.create(strategyMode);
+      const context: StrategyContext = {
         c,
-        finalTarget,
         request,
         requestHeaders,
         fn,
         method,
-        `${currentJsonPath}.targets[${originalIndex}]`,
-        currentInheritedConfig
+        currentJsonPath,
+      };
+      
+      response = await strategy.execute(
+        context,
+        currentTarget.targets,
+        currentInheritedConfig,
+        currentJsonPath
       );
-      break;
+    } catch (error: any) {
+      if (error.name === 'RouterError') {
+        throw error;
+      }
+      return RequestErrorHandler.handleTargetRecursionError(error);
     }
-
-    case StrategyModes.SINGLE:
-      const originalIndex = currentTarget.targets[0].originalIndex || 0;
-      response = await tryTargetsRecursively(
-        c,
-        currentTarget.targets[0],
-        request,
-        requestHeaders,
-        fn,
-        method,
-        `${currentJsonPath}.targets[${originalIndex}]`,
-        currentInheritedConfig
-      );
-      break;
+  }
 
     default:
       try {
@@ -795,30 +446,7 @@ export async function tryTargetsRecursively(
         // tryPost always returns a Response.
         // TypeError will check for all unhandled exceptions.
         // GatewayError will check for all handled exceptions which cannot allow the request to proceed.
-        console.error(
-          'tryTargetsRecursively error: ',
-          error.message,
-          error.cause,
-          error.stack
-        );
-        const errorMessage =
-          error instanceof GatewayError
-            ? error.message
-            : 'Something went wrong';
-        response = new Response(
-          JSON.stringify({
-            status: 'failure',
-            message: errorMessage,
-          }),
-          {
-            status: 500,
-            headers: {
-              'content-type': 'application/json',
-              // Add this header so that the fallback loop can be interrupted if its an exception.
-              'x-portkey-gateway-exception': 'true',
-            },
-          }
-        );
+        response = RequestErrorHandler.handleTargetRecursionError(error);
       }
       break;
   }
@@ -829,293 +457,7 @@ export async function tryTargetsRecursively(
 export function constructConfigFromRequestHeaders(
   requestHeaders: Record<string, any>
 ): Options | Targets {
-  const azureConfig = {
-    resourceName: requestHeaders[`x-${POWERED_BY}-azure-resource-name`],
-    deploymentId: requestHeaders[`x-${POWERED_BY}-azure-deployment-id`],
-    apiVersion: requestHeaders[`x-${POWERED_BY}-azure-api-version`],
-    azureAdToken: requestHeaders[`x-${POWERED_BY}-azure-ad-token`],
-    azureAuthMode: requestHeaders[`x-${POWERED_BY}-azure-auth-mode`],
-    azureManagedClientId:
-      requestHeaders[`x-${POWERED_BY}-azure-managed-client-id`],
-    azureEntraClientId: requestHeaders[`x-${POWERED_BY}-azure-entra-client-id`],
-    azureEntraClientSecret:
-      requestHeaders[`x-${POWERED_BY}-azure-entra-client-secret`],
-    azureEntraTenantId: requestHeaders[`x-${POWERED_BY}-azure-entra-tenant-id`],
-    azureModelName: requestHeaders[`x-${POWERED_BY}-azure-model-name`],
-    openaiBeta:
-      requestHeaders[`x-${POWERED_BY}-openai-beta`] ||
-      requestHeaders[`openai-beta`],
-  };
-
-  const stabilityAiConfig = {
-    stabilityClientId: requestHeaders[`x-${POWERED_BY}-stability-client-id`],
-    stabilityClientUserId:
-      requestHeaders[`x-${POWERED_BY}-stability-client-user-id`],
-    stabilityClientVersion:
-      requestHeaders[`x-${POWERED_BY}-stability-client-version`],
-  };
-
-  const azureAiInferenceConfig = {
-    azureApiVersion: requestHeaders[`x-${POWERED_BY}-azure-api-version`],
-    azureEndpointName: requestHeaders[`x-${POWERED_BY}-azure-endpoint-name`],
-    azureFoundryUrl: requestHeaders[`x-${POWERED_BY}-azure-foundry-url`],
-    azureExtraParams: requestHeaders[`x-${POWERED_BY}-azure-extra-params`],
-  };
-
-  const awsConfig = {
-    awsAccessKeyId: requestHeaders[`x-${POWERED_BY}-aws-access-key-id`],
-    awsSecretAccessKey: requestHeaders[`x-${POWERED_BY}-aws-secret-access-key`],
-    awsSessionToken: requestHeaders[`x-${POWERED_BY}-aws-session-token`],
-    awsRegion: requestHeaders[`x-${POWERED_BY}-aws-region`],
-    awsRoleArn: requestHeaders[`x-${POWERED_BY}-aws-role-arn`],
-    awsAuthType: requestHeaders[`x-${POWERED_BY}-aws-auth-type`],
-    awsExternalId: requestHeaders[`x-${POWERED_BY}-aws-external-id`],
-    awsS3Bucket: requestHeaders[`x-${POWERED_BY}-aws-s3-bucket`],
-    awsS3ObjectKey:
-      requestHeaders[`x-${POWERED_BY}-aws-s3-object-key`] ||
-      requestHeaders[`x-${POWERED_BY}-provider-file-name`],
-    awsBedrockModel:
-      requestHeaders[`x-${POWERED_BY}-aws-bedrock-model`] ||
-      requestHeaders[`x-${POWERED_BY}-provider-model`],
-    awsServerSideEncryption:
-      requestHeaders[`x-${POWERED_BY}-amz-server-side-encryption`],
-    awsServerSideEncryptionKMSKeyId:
-      requestHeaders[
-        `x-${POWERED_BY}-amz-server-side-encryption-aws-kms-key-id`
-      ],
-  };
-
-  const sagemakerConfig = {
-    amznSagemakerCustomAttributes:
-      requestHeaders[`x-${POWERED_BY}-amzn-sagemaker-custom-attributes`],
-    amznSagemakerTargetModel:
-      requestHeaders[`x-${POWERED_BY}-amzn-sagemaker-target-model`],
-    amznSagemakerTargetVariant:
-      requestHeaders[`x-${POWERED_BY}-amzn-sagemaker-target-variant`],
-    amznSagemakerTargetContainerHostname:
-      requestHeaders[
-        `x-${POWERED_BY}-amzn-sagemaker-target-container-hostname`
-      ],
-    amznSagemakerInferenceId:
-      requestHeaders[`x-${POWERED_BY}-amzn-sagemaker-inference-id`],
-    amznSagemakerEnableExplanations:
-      requestHeaders[`x-${POWERED_BY}-amzn-sagemaker-enable-explanations`],
-    amznSagemakerInferenceComponent:
-      requestHeaders[`x-${POWERED_BY}-amzn-sagemaker-inference-component`],
-    amznSagemakerSessionId:
-      requestHeaders[`x-${POWERED_BY}-amzn-sagemaker-session-id`],
-    amznSagemakerModelName:
-      requestHeaders[`x-${POWERED_BY}-amzn-sagemaker-model-name`],
-  };
-
-  const workersAiConfig = {
-    workersAiAccountId: requestHeaders[`x-${POWERED_BY}-workers-ai-account-id`],
-  };
-
-  const openAiConfig = {
-    openaiOrganization: requestHeaders[`x-${POWERED_BY}-openai-organization`],
-    openaiProject: requestHeaders[`x-${POWERED_BY}-openai-project`],
-    openaiBeta:
-      requestHeaders[`x-${POWERED_BY}-openai-beta`] ||
-      requestHeaders[`openai-beta`],
-  };
-
-  const huggingfaceConfig = {
-    huggingfaceBaseUrl: requestHeaders[`x-${POWERED_BY}-huggingface-base-url`],
-  };
-
-  const vertexConfig: Record<string, any> = {
-    vertexProjectId: requestHeaders[`x-${POWERED_BY}-vertex-project-id`],
-    vertexRegion: requestHeaders[`x-${POWERED_BY}-vertex-region`],
-    vertexStorageBucketName:
-      requestHeaders[`x-${POWERED_BY}-vertex-storage-bucket-name`],
-    filename: requestHeaders[`x-${POWERED_BY}-provider-file-name`],
-    vertexModelName: requestHeaders[`x-${POWERED_BY}-provider-model`],
-    vertexBatchEndpoint:
-      requestHeaders[`x-${POWERED_BY}-provider-batch-endpoint`],
-  };
-
-  const fireworksConfig = {
-    fireworksAccountId: requestHeaders[`x-${POWERED_BY}-fireworks-account-id`],
-    fireworksFileLength: requestHeaders[`x-${POWERED_BY}-file-upload-size`],
-  };
-
-  const anthropicConfig = {
-    anthropicBeta: requestHeaders[`x-${POWERED_BY}-anthropic-beta`],
-    anthropicVersion: requestHeaders[`x-${POWERED_BY}-anthropic-version`],
-  };
-
-  const vertexServiceAccountJson =
-    requestHeaders[`x-${POWERED_BY}-vertex-service-account-json`];
-
-  if (vertexServiceAccountJson) {
-    try {
-      vertexConfig.vertexServiceAccountJson = JSON.parse(
-        vertexServiceAccountJson
-      );
-    } catch (e) {
-      vertexConfig.vertexServiceAccountJson = null;
-    }
-  }
-
-  const cortexConfig = {
-    snowflakeAccount: requestHeaders[`x-${POWERED_BY}-snowflake-account`],
-  };
-
-  const defaultsConfig = {
-    input_guardrails: requestHeaders[`x-portkey-default-input-guardrails`]
-      ? JSON.parse(requestHeaders[`x-portkey-default-input-guardrails`])
-      : [],
-    output_guardrails: requestHeaders[`x-portkey-default-output-guardrails`]
-      ? JSON.parse(requestHeaders[`x-portkey-default-output-guardrails`])
-      : [],
-  };
-
-  if (requestHeaders[`x-${POWERED_BY}-config`]) {
-    let parsedConfigJson = JSON.parse(requestHeaders[`x-${POWERED_BY}-config`]);
-    parsedConfigJson.default_input_guardrails = defaultsConfig.input_guardrails;
-    parsedConfigJson.default_output_guardrails =
-      defaultsConfig.output_guardrails;
-
-    if (!parsedConfigJson.provider && !parsedConfigJson.targets) {
-      parsedConfigJson.provider = requestHeaders[`x-${POWERED_BY}-provider`];
-      parsedConfigJson.api_key = requestHeaders['authorization']?.replace(
-        'Bearer ',
-        ''
-      );
-
-      if (parsedConfigJson.provider === AZURE_OPEN_AI) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...azureConfig,
-        };
-      }
-
-      if (
-        parsedConfigJson.provider === BEDROCK ||
-        parsedConfigJson.provider === SAGEMAKER
-      ) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...awsConfig,
-        };
-      }
-
-      if (parsedConfigJson.provider === SAGEMAKER) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...sagemakerConfig,
-        };
-      }
-
-      if (parsedConfigJson.provider === WORKERS_AI) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...workersAiConfig,
-        };
-      }
-
-      if (parsedConfigJson.provider === OPEN_AI) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...openAiConfig,
-        };
-      }
-
-      if (parsedConfigJson.provider === HUGGING_FACE) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...huggingfaceConfig,
-        };
-      }
-
-      if (parsedConfigJson.provider === GOOGLE_VERTEX_AI) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...vertexConfig,
-        };
-      }
-
-      if (parsedConfigJson.provider === FIREWORKS_AI) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...fireworksConfig,
-        };
-      }
-
-      if (parsedConfigJson.provider === AZURE_AI_INFERENCE) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...azureAiInferenceConfig,
-        };
-      }
-      if (parsedConfigJson.provider === ANTHROPIC) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...anthropicConfig,
-        };
-      }
-      if (parsedConfigJson.provider === STABILITY_AI) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...stabilityAiConfig,
-        };
-      }
-
-      if (parsedConfigJson.provider === CORTEX) {
-        parsedConfigJson = {
-          ...parsedConfigJson,
-          ...cortexConfig,
-        };
-      }
-    }
-    return convertKeysToCamelCase(parsedConfigJson, [
-      'override_params',
-      'params',
-      'checks',
-      'vertex_service_account_json',
-      'vertexServiceAccountJson',
-      'conditions',
-      'input_guardrails',
-      'output_guardrails',
-      'default_input_guardrails',
-      'default_output_guardrails',
-      'integrationModelDetails',
-      'cb_config',
-    ]) as any;
-  }
-
-  return {
-    provider: requestHeaders[`x-${POWERED_BY}-provider`],
-    apiKey: requestHeaders['authorization']?.replace('Bearer ', ''),
-    defaultInputGuardrails: defaultsConfig.input_guardrails,
-    defaultOutputGuardrails: defaultsConfig.output_guardrails,
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === AZURE_OPEN_AI &&
-      azureConfig),
-    ...([BEDROCK, SAGEMAKER].includes(
-      requestHeaders[`x-${POWERED_BY}-provider`]
-    ) && awsConfig),
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === SAGEMAKER &&
-      sagemakerConfig),
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === WORKERS_AI &&
-      workersAiConfig),
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === GOOGLE_VERTEX_AI &&
-      vertexConfig),
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === AZURE_AI_INFERENCE &&
-      azureAiInferenceConfig),
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === OPEN_AI && openAiConfig),
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === ANTHROPIC &&
-      anthropicConfig),
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === HUGGING_FACE &&
-      huggingfaceConfig),
-    mistralFimCompletion:
-      requestHeaders[`x-${POWERED_BY}-mistral-fim-completion`],
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === STABILITY_AI &&
-      stabilityAiConfig),
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === FIREWORKS_AI &&
-      fireworksConfig),
-    ...(requestHeaders[`x-${POWERED_BY}-provider`] === CORTEX && cortexConfig),
-  };
+  return ProviderConfigBuilder.build(requestHeaders);
 }
 
 export async function recursiveAfterRequestHookHandler(
@@ -1240,6 +582,7 @@ export async function beforeRequestHookHandler(
 ): Promise<any> {
   let span: HookSpan;
   let isTransformed = false;
+  
   try {
     const start = new Date();
     const hooksManager = c.get('hooksManager');
@@ -1252,38 +595,21 @@ export async function beforeRequestHookHandler(
         putInCacheWithValue: c.get('putInCacheWithValue'),
       }
     );
+    
     span = hooksManager.getSpan(hookSpanId) as HookSpan;
     isTransformed = span.getContext().request.isTransformed;
 
     if (hooksResult.shouldDeny) {
       return {
-        response: new Response(
-          JSON.stringify({
-            error: {
-              message:
-                'The guardrail checks defined in the config failed. You can find more information in the `hook_results` object.',
-              type: 'hooks_failed',
-              param: null,
-              code: null,
-            },
-            hook_results: {
-              before_request_hooks: hooksResult.results,
-              after_request_hooks: [],
-            },
-          }),
-          {
-            status: 446,
-            headers: { 'content-type': 'application/json' },
-          }
-        ),
+        response: RequestErrorHandler.createHooksFailureResponse(hooksResult.results, start),
         createdAt: start,
         transformedBody: isTransformed ? span.getContext().request.json : null,
       };
     }
   } catch (err) {
-    console.error('beforeRequestHookHandler error: ', err);
-    return { error: err };
+    return RequestErrorHandler.handleBeforeRequestHookError(err);
   }
+  
   return {
     transformedBody: isTransformed ? span.getContext().request.json : null,
   };
